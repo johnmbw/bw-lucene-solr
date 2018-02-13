@@ -176,7 +176,7 @@ public class TopGroupsShardResponseProcessor implements ShardResponseProcessor {
         mergedMatches += queryCommandResult.getMatches();
       }
 
-      int topN = rb.getGroupingSpec().getOffset() + rb.getGroupingSpec().getLimit();
+      int topN = groupOffsetDefault + docsPerGroupDefault;
       final TopDocs mergedTopDocs;
       if (withinGroupSort.equals(Sort.RELEVANCE)) {
         mergedTopDocs = TopDocs.merge(topN, topDocs.toArray(new TopDocs[topDocs.size()]));
