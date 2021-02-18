@@ -20,12 +20,23 @@ import static org.apache.solr.common.SolrException.ErrorCode.SERVER_ERROR;
 import static org.apache.solr.update.processor.DistributingUpdateProcessorFactory.DISTRIB_UPDATE_PARAM;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.util.BytesRef;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrInputDocument;
+import org.apache.solr.common.SolrInputField;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.core.SolrCore;
 import org.apache.solr.handler.component.RealTimeGetComponent;
@@ -34,19 +45,25 @@ import org.apache.solr.response.SolrQueryResponse;
 import org.apache.solr.update.AddUpdateCommand;
 import org.apache.solr.update.UpdateCommand;
 import org.apache.solr.util.plugin.SolrCoreAware;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class ConditionalUpsertProcessorFactory extends UpdateRequestProcessorFactory implements SolrCoreAware, UpdateRequestProcessorFactory.RunAlways {
-  private static final String UPSERT_WHEN = "upsertWhen";
-  private static final String SKIP_WHEN = "skipWhen";
+  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 
-  private FieldCondition upsertCondition = null;
-  private FieldCondition skipCondition = null;
+  private final List<Condition> conditions = new ArrayList<>();
 
   @Override
   public void init(NamedList args)  {
-    upsertCondition = fromArgs(args, UPSERT_WHEN);
-    skipCondition = fromArgs(args, SKIP_WHEN);
-
+    for (Map.Entry<String, ?> entry: (NamedList<?>)args) {
+      String name = entry.getKey();
+      Object tmp = entry.getValue();
+      if (tmp instanceof NamedList) {
+        NamedList<String> condition = (NamedList<String>)tmp;
+        conditions.add(Condition.parse(name, condition));
+      }
+      // TODO errors etc
+    }
     super.init(args);
   }
 
@@ -54,7 +71,7 @@ public class ConditionalUpsertProcessorFactory extends UpdateRequestProcessorFac
   public ConditionalUpsertUpdateProcessor getInstance(SolrQueryRequest req,
                                                           SolrQueryResponse rsp,
                                                           UpdateRequestProcessor next) {
-    return new ConditionalUpsertUpdateProcessor(req, next, upsertCondition, skipCondition);
+    return new ConditionalUpsertUpdateProcessor(req, next, conditions);
   }
 
   @Override
@@ -73,17 +90,14 @@ public class ConditionalUpsertProcessorFactory extends UpdateRequestProcessorFac
 
     private DistributedUpdateProcessor distribProc;  // the distributed update processor following us
     private DistributedUpdateProcessor.DistribPhase phase;
-    private final FieldCondition upsertCondition;
-    private final FieldCondition skipCondition;
+    private final List<Condition> conditions;
 
     ConditionalUpsertUpdateProcessor(SolrQueryRequest req,
-                                 UpdateRequestProcessor next,
-                                 FieldCondition upsertCondition,
-                                 FieldCondition skipCondition) {
+                                     UpdateRequestProcessor next,
+                                     List<Condition> conditions) {
       super(next);
       this.core = req.getCore();
-      this.upsertCondition = upsertCondition;
-      this.skipCondition = skipCondition;
+      this.conditions = conditions;
 
       for (UpdateRequestProcessor proc = next ;proc != null; proc = proc.next) {
         if (proc instanceof DistributedUpdateProcessor) {
@@ -113,27 +127,20 @@ public class ConditionalUpsertProcessorFactory extends UpdateRequestProcessorFac
     public void processAdd(AddUpdateCommand cmd) throws IOException {
       BytesRef indexedDocId = cmd.getIndexedId();
 
-      if ((upsertCondition != null || skipCondition != null) && isLeader(cmd)) {
+      if (!conditions.isEmpty() && isLeader(cmd)) {
         SolrInputDocument newDoc = cmd.getSolrInputDocument();
         SolrInputDocument oldDoc = RealTimeGetComponent.getInputDocument(core, indexedDocId);
         if (oldDoc != null) {
-          if (skipCondition != null && skipCondition.matches(oldDoc)) {
-            // don't add the doc (tombstone present)
-            return;
-          }
-          if (upsertCondition != null) {
-            if (upsertCondition.matches(newDoc)) {
-              // ensure we copy over the other old fields
-              oldDoc.forEach((field, value) -> {
-                if (!newDoc.containsKey(field)) {
-                  newDoc.put(field, value);
-                }
-              });
-            } else if (upsertCondition.matches(oldDoc)) {
-              // ensure we copy over the old value for the upsert field
-              String upsertField = upsertCondition.getField();
-              Object existingValue = oldDoc.getFieldValue(upsertField);
-              newDoc.setField(upsertField, existingValue);
+          Docs docs = new Docs(oldDoc, newDoc);
+          for (Condition condition: conditions) {
+            if (condition.matches(docs)) {
+              log.info("Condition {} matched, taking action", condition.getName());
+              if (condition.isSkip()) {
+                log.info("Condition {} matched - skipping insert", condition.getName());
+                return;
+              }
+              condition.copyOldDocFields(docs);
+              break;
             }
           }
         }
@@ -142,42 +149,157 @@ public class ConditionalUpsertProcessorFactory extends UpdateRequestProcessorFac
     }
   }
 
-  FieldCondition fromArgs(NamedList args, String name) {
-    Object tmp = args.remove(name);
-    if (null != tmp) {
-      if (! (tmp instanceof String) ) {
-        throw new SolrException(SERVER_ERROR, "'" + name + "' must be configured as a <string>");
+  private static class Docs {
+    private final SolrInputDocument oldDoc;
+    private final SolrInputDocument newDoc;
+
+    Docs(SolrInputDocument oldDoc, SolrInputDocument newDoc) {
+      this.oldDoc = oldDoc;
+      this.newDoc = newDoc;
+    }
+
+    SolrInputDocument getOldDoc() {
+      return oldDoc;
+    }
+
+    SolrInputDocument getNewDoc() {
+      return newDoc;
+    }
+  }
+
+  private static class Condition {
+    private static final Pattern ACTION_PATTERN = Pattern.compile("^(skip)|(upsert):(\\*|[\\w,]+)$");
+    private static final List<String> ALL_FIELDS = Collections.singletonList("*");
+
+    private final String name;
+    private final List<FieldRule> rules;
+    private final boolean skip;
+    private final List<String> upsertFields;
+
+    Condition(String name, boolean skip, List<String> upsertFields, List<FieldRule> rules) {
+      this.name = name;
+      this.skip = skip;
+      this.upsertFields = upsertFields;
+      this.rules = rules;
+    }
+
+    static Condition parse(String name, NamedList<String> args) {
+      List<FieldRule> rules = new ArrayList<>();
+      boolean skip = false;
+      List<String> upsertFields = null;
+      for (Map.Entry<String, String> entry: args) {
+        String key = entry.getKey();
+        if ("action".equals(key)) {
+          String action = entry.getValue();
+          Matcher m = ACTION_PATTERN.matcher(action);
+          if (!m.matches()) {
+            throw new SolrException(SERVER_ERROR, "'" + action + "' not a valid action");
+          }
+          if (m.group(1) != null) {
+            skip = true;
+            upsertFields = null;
+          } else {
+            skip = false;
+            String fields = m.group(3);
+            upsertFields = Arrays.asList(fields.split(","));
+          }
+        } else {
+          BooleanClause.Occur occur = BooleanClause.Occur.valueOf(key.toUpperCase(Locale.ROOT));
+          String value = entry.getValue();
+          rules.add(FieldRule.parse(occur, value));
+        }
       }
-      return parse((String)tmp);
+      return new Condition(name, skip, upsertFields, rules);
     }
-    return null;
+
+    String getName() {
+      return name;
+    }
+
+    boolean isSkip() {
+      return skip;
+    }
+
+    void copyOldDocFields(Docs docs) {
+      SolrInputDocument oldDoc = docs.getOldDoc();
+      SolrInputDocument newDoc = docs.getNewDoc();
+      Collection<String> fieldsToCopy;
+      if (ALL_FIELDS.equals(upsertFields)) {
+        fieldsToCopy = oldDoc.keySet();
+      } else {
+        fieldsToCopy = upsertFields;
+      }
+      fieldsToCopy.forEach(field -> {
+        if (!newDoc.containsKey(field)) {
+          SolrInputField inputField = oldDoc.getField(field);
+          newDoc.put(field, inputField);
+        }
+      });
+    }
+
+    boolean matches(Docs docs) {
+      boolean atLeastOneMatched = false;
+      for (FieldRule rule: rules) {
+        boolean ruleMatched = rule.matches(docs);
+        switch(rule.getOccur()) {
+          case MUST:
+            if (!ruleMatched) {
+              return false;
+            }
+            atLeastOneMatched = true;
+            break;
+          case MUST_NOT:
+            if (ruleMatched) {
+              return false;
+            }
+            break;
+          default:
+            atLeastOneMatched = ruleMatched || atLeastOneMatched;
+            break;
+        }
+      }
+      return atLeastOneMatched;
+    }
   }
 
-  FieldCondition parse(String condition) {
-    Pattern p = Pattern.compile("^(\\w+):(\\w+)$");
-    Matcher m = p.matcher(condition);
-    if (m.matches()) {
-      String field = m.group(1);
-      String value = m.group(2);
-      return new FieldCondition(field, value);
-    }
-    throw new SolrException(SERVER_ERROR, "'" + condition + "' not a valid condition");
-  }
+  private static class FieldRule {
+    private static final Pattern RULE_CONDITION_PATTERN = Pattern.compile("^(OLD|NEW)\\.(\\w+):(\\w+)$");
 
-  static class FieldCondition {
+    private final BooleanClause.Occur occur;
+    private final Function<Docs, SolrInputDocument> docGetter;
     private final String field;
     private final String value;
 
-    FieldCondition(String field, String value) {
+    private FieldRule(BooleanClause.Occur occur, Function<Docs, SolrInputDocument> docGetter, String field, String value) {
+      this.occur = occur;
+      this.docGetter = docGetter;
       this.field = field;
       this.value = value;
     }
 
-    String getField() {
-      return field;
+    static FieldRule parse(BooleanClause.Occur occur, String condition) {
+      Matcher m = RULE_CONDITION_PATTERN.matcher(condition);
+      if (m.matches()) {
+        String doc = m.group(1);
+        String field = m.group(2);
+        String value = m.group(3);
+        Function<Docs, SolrInputDocument> docGetter;
+        if (doc.equalsIgnoreCase("OLD")) {
+          docGetter = Docs::getOldDoc;
+        } else {
+          docGetter = Docs::getNewDoc;
+        }
+        return new FieldRule(occur, docGetter, field, value);
+      }
+      throw new SolrException(SERVER_ERROR, "'" + condition + "' not a valid condition for rule");
     }
 
-    boolean matches(SolrInputDocument doc) {
+    BooleanClause.Occur getOccur() {
+      return occur;
+    }
+
+    boolean matches(Docs docs) {
+      SolrInputDocument doc = docGetter.apply(docs);
       return value.equals(doc.getFieldValue(field));
     }
   }
