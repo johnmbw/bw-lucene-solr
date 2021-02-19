@@ -72,13 +72,21 @@ class UpsertCondition {
           upsertFields = Arrays.asList(fields.split(","));
         }
       } else {
-        BooleanClause.Occur occur = BooleanClause.Occur.valueOf(key.toUpperCase(Locale.ROOT));
+        BooleanClause.Occur occur;
+        try {
+          occur = BooleanClause.Occur.valueOf(key.toUpperCase(Locale.ROOT));
+        } catch(IllegalArgumentException e) {
+          throw new SolrException(SERVER_ERROR, "'" + key + "' not a valid occurence value");
+        }
         String value = entry.getValue();
         rules.add(FieldRule.parse(occur, value));
       }
     }
     if (!skip && upsertFields == null) {
       throw new SolrException(SERVER_ERROR, "no action defined for condition: " + name);
+    }
+    if (rules.isEmpty()) {
+      throw new SolrException(SERVER_ERROR, "no rules specified for condition: " + name);
     }
     return new UpsertCondition(name, skip, upsertFields, rules);
   }
@@ -92,6 +100,9 @@ class UpsertCondition {
   }
 
   void copyOldDocFields(SolrInputDocument oldDoc, SolrInputDocument newDoc) {
+    if (skip) {
+      throw new IllegalStateException("Cannot copy old doc fields when skipping");
+    }
     Collection<String> fieldsToCopy;
     if (ALL_FIELDS.equals(upsertFields)) {
       fieldsToCopy = oldDoc.keySet();
@@ -122,6 +133,7 @@ class UpsertCondition {
           if (ruleMatched) {
             return false;
           }
+          atLeastOneMatched = true;
           break;
         default:
           atLeastOneMatched = ruleMatched || atLeastOneMatched;
