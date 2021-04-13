@@ -29,6 +29,7 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import org.apache.lucene.search.BooleanClause;
 import org.apache.solr.common.SolrException;
@@ -249,12 +250,35 @@ class UpsertCondition {
       };
     }
 
+    private static Predicate<Map<?,?>> forAtomicUpdate(Predicate<Object> fieldPredicate) {
+      return fieldValue -> {
+        if (fieldValue.containsKey("set") || fieldValue.containsKey("add")) {
+          return fieldValue.values().stream()
+              .flatMap(updateValue -> {
+                if (updateValue instanceof Collection) {
+                  return ((Collection<?>)updateValue).stream();
+                }
+                return Stream.of(updateValue);
+              })
+              .anyMatch(fieldPredicate);
+        }
+        return false;
+      };
+    }
+
     private static Predicate<SolrInputDocument> forField(String field, Predicate<Object> fieldPredicate) {
+      Predicate<Map<?,?>> atomicUpdatePredicate = forAtomicUpdate(fieldPredicate);
+      Predicate<Object> predicate = fieldValue -> {
+        if (fieldValue instanceof Map) {
+          return atomicUpdatePredicate.test((Map<?,?>)fieldValue);
+        }
+        return fieldPredicate.test(fieldValue);
+      };
       return doc -> {
         if (doc != null) {
           Collection<Object> values = doc.getFieldValues(field);
           if (values != null) {
-            return values.stream().anyMatch(fieldPredicate);
+            return values.stream().anyMatch(predicate);
           }
         }
         return false;

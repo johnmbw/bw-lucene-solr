@@ -1,8 +1,10 @@
 package org.apache.solr.update.processor;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ListMultimap;
@@ -176,6 +178,87 @@ public class UpsertConditionTest {
 
     oldDoc.setField("field", 123);
     assertTrue(condition.matches(oldDoc, newDoc));
+  }
+
+  @Test
+  public void givenAtomicUpdateSet_whenMatching() {
+    NamedList<String> args = new NamedList<>(ImmutableMap.of(
+        "must", "NEW.field:value",
+        "action", "skip"
+    ));
+
+    UpsertCondition condition = UpsertCondition.parse("skip-it", args);
+
+    assertThat(condition.getName(), is("skip-it"));
+
+    SolrInputDocument oldDoc = new SolrInputDocument();
+    SolrInputDocument newDoc = new SolrInputDocument();
+
+    newDoc.setField("field", Collections.singletonMap("set", "other1"));
+    assertFalse(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("set", "value"));
+    assertTrue(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("set", ImmutableList.of("value", "other2")));
+    assertTrue(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("set", ImmutableList.of("other1", "other2")));
+    assertFalse(condition.matches(oldDoc, newDoc));
+  }
+
+  @Test
+  public void givenAtomicUpdateAdd_whenMatching() {
+    NamedList<String> args = new NamedList<>(ImmutableMap.of(
+        "must", "NEW.field:value",
+        "action", "skip"
+    ));
+
+    UpsertCondition condition = UpsertCondition.parse("skip-it", args);
+
+    assertThat(condition.getName(), is("skip-it"));
+
+    SolrInputDocument oldDoc = new SolrInputDocument();
+    SolrInputDocument newDoc = new SolrInputDocument();
+
+    newDoc.setField("field", Collections.singletonMap("add", "other1"));
+    assertFalse(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("add", "value"));
+    assertTrue(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("add", ImmutableList.of("value", "other2")));
+    assertTrue(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("add", ImmutableList.of("other1", "other2")));
+    assertFalse(condition.matches(oldDoc, newDoc));
+  }
+
+  @Test
+  public void givenAtomicUpdateRemove_whenMatching() {
+    NamedList<String> args = new NamedList<>(ImmutableMap.of(
+        "must", "NEW.field:value",
+        "action", "skip"
+    ));
+
+    UpsertCondition condition = UpsertCondition.parse("skip-it", args);
+
+    assertThat(condition.getName(), is("skip-it"));
+
+    SolrInputDocument oldDoc = new SolrInputDocument();
+    SolrInputDocument newDoc = new SolrInputDocument();
+
+    oldDoc.setField("field", Collections.singletonMap("remove", "other1"));
+    assertFalse(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("remove", "value"));
+    assertFalse(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("remove", ImmutableList.of("value", "other2")));
+    assertFalse(condition.matches(oldDoc, newDoc));
+
+    newDoc.setField("field", Collections.singletonMap("remove", ImmutableList.of("other1", "other2")));
+    assertFalse(condition.matches(oldDoc, newDoc));
   }
 
   @Test
